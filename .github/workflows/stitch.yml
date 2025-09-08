@@ -43,6 +43,31 @@ jobs:
           scope = drive
           service_account_file = ./sa.json
           EOF
+      - name: Preflight Drive (sin exponer IDs)
+        env:
+          SRC_ID: ${{ secrets.DRIVE_SRC_ID }}
+          DST_ID: ${{ secrets.DRIVE_DST_ID }}
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        run: |
+          set -e
+          # 1) Secrets presentes
+          [ -z "$SRC_ID" ] && { echo "❌ DRIVE_SRC_ID está vacío"; exit 2; }
+          # 2) ¿Veo la carpeta origen?
+          if ! rclone lsf --drive-root-folder-id="$SRC_ID" gdrive: --max-depth 0 --log-level ERROR >/dev/null; then
+            echo "❌ La SA no puede listar la carpeta origen. Comprueba:"
+            echo "   - La SA es miembro/editor de esa carpeta o de la Unidad compartida"
+            echo "   - El ID es de CARPETA, no de archivo"
+            echo "   - Si la URL tenía ?resourcekey=..., compártela con la SA o usa --drive-resource-key"
+            exit 3
+          fi
+          # 3) Carpeta destino (si está definida)
+          if [ -n "$DST_ID" ]; then
+            if ! rclone lsf --drive-root-folder-id="$DST_ID" gdrive: --max-depth 0 --log-level ERROR >/dev/null; then
+              echo "❌ No puedo listar la carpeta destino (permisos/ID)."
+              exit 4
+            fi
+          fi
+          echo "✅ Preflight OK"
 
       - name: Descargar fuentes desde Drive (sin exponer rutas)
         env:
