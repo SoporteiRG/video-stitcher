@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       input_id:
-        description: "ID del vídeo principal (archivo de Drive)"
+        description: "ID del video principal (archivo de Drive)"
         required: true
       intro_id:
-        description: "ID del vídeo de intro (archivo de Drive)"
+        description: "ID del video de intro (archivo de Drive)"
         required: true
       outro_id:
-        description: "ID del vídeo de outro (archivo de Drive)"
+        description: "ID del video de outro (archivo de Drive)"
         required: true
       output_basename:
         description: "Nombre base de salida (sin .mp4)"
@@ -21,13 +21,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: "Instalar ffmpeg, rclone y jq"
+      - name: Install ffmpeg, rclone and jq
+        shell: bash
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: "Configurar rclone con Service Account (sin root_folder_id)"
+      - name: Configure rclone with Service Account (no root_folder_id)
+        shell: bash
         env:
           SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
         run: |
@@ -41,8 +44,9 @@ jobs:
           service_account_file = ./sa.json
           EOF
 
-      - name: "Preflight: obtener nombres por ID (y comprobar permisos)"
+      - name: Preflight - resolve names from IDs and check access
         id: meta
+        shell: bash
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
           IN_ID: ${{ inputs.input_id }}
@@ -57,20 +61,21 @@ jobs:
           INTRO_NAME=$(get_name "$INTRO_ID")
           OUTRO_NAME=$(get_name "$OUTRO_ID")
 
-          [ -z "$IN_NAME" ] && { echo "❌ Sin acceso al ID de ENTRADA"; exit 6; }
-          [ -z "$INTRO_NAME" ] && { echo "❌ Sin acceso al ID de INTRO"; exit 6; }
-          [ -z "$OUTRO_NAME" ] && { echo "❌ Sin acceso al ID de OUTRO"; exit 6; }
+          [ -z "$IN_NAME" ] && { echo "ERROR: sin acceso al ID de entrada"; exit 6; }
+          [ -z "$INTRO_NAME" ] && { echo "ERROR: sin acceso al ID de intro"; exit 6; }
+          [ -z "$OUTRO_NAME" ] && { echo "ERROR: sin acceso al ID de outro"; exit 6; }
 
           echo "in_name=$IN_NAME" >> $GITHUB_OUTPUT
           echo "intro_name=$INTRO_NAME" >> $GITHUB_OUTPUT
           echo "outro_name=$OUTRO_NAME" >> $GITHUB_OUTPUT
 
-          echo "✅ IDs resueltos a nombres:"
+          echo "IDs ok:"
           echo " - Input: $IN_NAME"
           echo " - Intro: $INTRO_NAME"
           echo " - Outro: $OUTRO_NAME"
 
-      - name: "Descargar por ID (copyid)"
+      - name: Download by file IDs (copyid)
+        shell: bash
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
@@ -80,8 +85,9 @@ jobs:
           rclone backend copyid gdrive: "${{ inputs.intro_id }}"  "in/"
           rclone backend copyid gdrive: "${{ inputs.outro_id }}"  "in/"
 
-      - name: "Detectar parámetros del vídeo principal"
+      - name: Probe main video parameters
         id: probe
+        shell: bash
         run: |
           set -e
           VFILE="in/${{ steps.meta.outputs.in_name }}"
@@ -92,14 +98,19 @@ jobs:
           A_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$VFILE" || echo "aac")
           A_SR=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$VFILE" || echo "48000")
           A_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$VFILE" || echo "2")
+
           case "$V_CODEC" in
             h264) VLIB=libx264 ;;
             hevc|h265) VLIB=libx265; V_CODEC=hevc ;;
             *) VLIB=libx264; V_CODEC=h264 ;;
           esac
           case "$A_CODEC" in
-            aac) ALIB=aac ;; mp3) ALIB=libmp3lame ;; opus) ALIB=libopus ;; *) ALIB=aac; A_CODEC=aac ;;
+            aac) ALIB=aac ;;
+            mp3) ALIB=libmp3lame ;;
+            opus) ALIB=libopus ;;
+            *) ALIB=aac; A_CODEC=aac ;;
           esac
+
           echo "vlib=$VLIB"      >> $GITHUB_OUTPUT
           echo "width=$WIDTH"    >> $GITHUB_OUTPUT
           echo "height=$HEIGHT"  >> $GITHUB_OUTPUT
@@ -108,7 +119,8 @@ jobs:
           echo "asr=$A_SR"       >> $GITHUB_OUTPUT
           echo "ach=$A_CH"       >> $GITHUB_OUTPUT
 
-      - name: "Adaptar SOLO intro y outro al principal"
+      - name: Transcode only intro and outro to match main
+        shell: bash
         run: |
           set -e
           VLIB='${{ steps.probe.outputs.vlib }}'
@@ -127,19 +139,21 @@ jobs:
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
             -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" outro_t.mp4
 
-      - name: "Concatenar (try -c copy; fallback recodificación)"
+      - name: Concat (try -c copy, fallback reencode)
+        shell: bash
         run: |
           set -e
           printf "file 'intro_t.mp4'\nfile 'in/${{ steps.meta.outputs.in_name }}'\nfile 'outro_t.mp4'\n" > list.txt
           if ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt -c copy out.mp4; then
-            echo "Concat -c copy OK"
+            echo "Concat with -c copy OK"
           else
-            echo "Param mismatch; recodificando todo (tardará más)"
+            echo "Param mismatch; reencoding all"
             ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt \
               -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k out.mp4
           fi
 
-      - name: "Subir salida a carpeta de destino por ID"
+      - name: Upload output to destination folder by ID
+        shell: bash
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
           DST_ID: ${{ secrets.DRIVE_DST_ID }}
@@ -153,6 +167,4 @@ jobs:
           else
             rclone copyto out.mp4 "gdrive:${OUT}" --log-level ERROR
           fi
-
-      - name: "Mostrar nombre final"
-        run: echo "Subido: ${{ inputs.output_basename }}.mp4"
+          echo "Uploaded: ${OUT}"
