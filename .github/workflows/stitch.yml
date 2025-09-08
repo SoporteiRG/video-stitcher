@@ -21,13 +21,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: Instalar ffmpeg, rclone y jq
+      - name: "Instalar ffmpeg, rclone y jq"
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Configurar rclone con Service Account (sin root_folder_id)
+      - name: "Configurar rclone con Service Account (sin root_folder_id)"
         env:
           SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
         run: |
@@ -41,7 +41,7 @@ jobs:
           service_account_file = ./sa.json
           EOF
 
-      - name: Preflight obtener nombres por ID (y comprobar permisos)
+      - name: "Preflight: obtener nombres por ID (y comprobar permisos)"
         id: meta
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
@@ -51,47 +51,36 @@ jobs:
         run: |
           set -e
           get_name () {
-            # Usa la query nativa de Drive para resolver ID -> nombre
-            rclone backend query gdrive: "id = '$1'" \
-              | jq -r '.[0].name // empty'
+            rclone backend query gdrive: "id = '$1'" | jq -r '.[0].name // empty'
           }
           IN_NAME=$(get_name "$IN_ID")
           INTRO_NAME=$(get_name "$INTRO_ID")
           OUTRO_NAME=$(get_name "$OUTRO_ID")
 
-          if [ -z "$IN_NAME" ]; then
-            echo "❌ No tengo acceso al ID de ENTRADA: $IN_ID"
-            echo "   Asegúrate de que la Service Account tenga permiso sobre ese archivo (o la Unidad compartida)."
-            exit 6
-          fi
-          if [ -z "$INTRO_NAME" ]; then
-            echo "❌ No tengo acceso al ID de INTRO: $INTRO_ID"
-            exit 6
-          fi
-          if [ -z "$OUTRO_NAME" ]; then
-            echo "❌ No tengo acceso al ID de OUTRO: $OUTRO_ID"
-            exit 6
-          fi
+          [ -z "$IN_NAME" ] && { echo "❌ Sin acceso al ID de ENTRADA"; exit 6; }
+          [ -z "$INTRO_NAME" ] && { echo "❌ Sin acceso al ID de INTRO"; exit 6; }
+          [ -z "$OUTRO_NAME" ] && { echo "❌ Sin acceso al ID de OUTRO"; exit 6; }
 
           echo "in_name=$IN_NAME" >> $GITHUB_OUTPUT
           echo "intro_name=$INTRO_NAME" >> $GITHUB_OUTPUT
           echo "outro_name=$OUTRO_NAME" >> $GITHUB_OUTPUT
 
-          echo "✅ Resolver ID→nombre:"
+          echo "✅ IDs resueltos a nombres:"
           echo " - Input: $IN_NAME"
           echo " - Intro: $INTRO_NAME"
           echo " - Outro: $OUTRO_NAME"
 
-      - name: Descargar por ID (copyid)
+      - name: "Descargar por ID (copyid)"
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
           set -e
           mkdir -p in
-          # copyid copia por ID a un PATH rclone (si termina en / mantiene el nombre original)
-          rclone backend copyid gdrive: "${{ inputs.input_id }}" in/ "${{ inputs.intro_id }}" in/ "${{ inputs.outro_id }}" in/
+          rclone backend copyid gdrive: "${{ inputs.input_id }}"  "in/"
+          rclone backend copyid gdrive: "${{ inputs.intro_id }}"  "in/"
+          rclone backend copyid gdrive: "${{ inputs.outro_id }}"  "in/"
 
-      - name: Detectar parámetros del vídeo principal
+      - name: "Detectar parámetros del vídeo principal"
         id: probe
         run: |
           set -e
@@ -119,7 +108,7 @@ jobs:
           echo "asr=$A_SR"       >> $GITHUB_OUTPUT
           echo "ach=$A_CH"       >> $GITHUB_OUTPUT
 
-      - name: Adaptar SOLO intro y outro al principal
+      - name: "Adaptar SOLO intro y outro al principal"
         run: |
           set -e
           VLIB='${{ steps.probe.outputs.vlib }}'
@@ -138,7 +127,7 @@ jobs:
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
             -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" outro_t.mp4
 
-      - name: Concatenar (try -c copy; fallback recodificación)
+      - name: "Concatenar (try -c copy; fallback recodificación)"
         run: |
           set -e
           printf "file 'intro_t.mp4'\nfile 'in/${{ steps.meta.outputs.in_name }}'\nfile 'outro_t.mp4'\n" > list.txt
@@ -150,7 +139,7 @@ jobs:
               -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k out.mp4
           fi
 
-      - name: Subir salida a carpeta de destino por ID
+      - name: "Subir salida a carpeta de destino por ID"
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
           DST_ID: ${{ secrets.DRIVE_DST_ID }}
@@ -158,14 +147,12 @@ jobs:
           set -e
           OUT="${{ inputs.output_basename }}.mp4"
           if [ -n "$DST_ID" ]; then
-            # Creamos un segundo config con root_folder_id = carpeta destino
             cp "$RCLONE_CONFIG" rclone.dst.conf
             echo "root_folder_id = $DST_ID" >> rclone.dst.conf
             RCLONE_CONFIG=$(pwd)/rclone.dst.conf rclone copyto out.mp4 "gdrive:${OUT}" --log-level ERROR
           else
-            # Si no hay destino, sube al raíz de la SA
             rclone copyto out.mp4 "gdrive:${OUT}" --log-level ERROR
           fi
 
-      - name: Mostrar nombre final
+      - name: "Mostrar nombre final"
         run: echo "✅ Subido: ${{ inputs.output_basename }}.mp4"
