@@ -19,9 +19,10 @@ on:
 jobs:
   stitch:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # < 6h límite de runner hospedado
+    timeout-minutes: 350  # < 6h en runners hospedados
+
     steps:
-      - name: Endurecer logs
+      - name: Endurecer logs (enmascarar inputs por si aparecieran)
         run: |
           echo "::add-mask::${{ inputs.input_filename }}"
           echo "::add-mask::${{ inputs.intro_filename }}"
@@ -33,39 +34,45 @@ jobs:
           sudo apt-get install -y ffmpeg
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Configurar rclone con Service Account
+      - name: Configurar rclone con Service Account y raíz de ORIGEN (secrets)
+        env:
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          SRC_ID: ${{ secrets.DRIVE_SRC_ID }}
         run: |
+          set -e
           umask 077
-          printf '%s' '${{ secrets.GDRIVE_SA_JSON }}' > sa.json
+          # Clave de la Service Account
+          printf '%s' "$SA_JSON" > sa.json
+
+          # rclone.conf anclado a la carpeta de ORIGEN vía root_folder_id (sin exponer IDs)
           cat > rclone.conf <<'EOF'
           [gdrive]
           type = drive
           scope = drive
           service_account_file = ./sa.json
+          root_folder_id = __ROOT__
           EOF
-      - name: Preflight Drive (sin exponer IDs)
+          perl -0777 -pe 's/__ROOT__/$ENV{"SRC_ID"}/g' -i rclone.conf
+
+      - name: Preflight Drive (comprobar acceso a origen/destino sin imprimir IDs)
         env:
-          SRC_ID: ${{ secrets.DRIVE_SRC_ID }}
-          DST_ID: ${{ secrets.DRIVE_DST_ID }}
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+          DST_ID: ${{ secrets.DRIVE_DST_ID }}
         run: |
           set -e
-          # 1) Secrets presentes
-          [ -z "$SRC_ID" ] && { echo "❌ DRIVE_SRC_ID está vacío"; exit 2; }
-          # 2) ¿Veo la carpeta origen?
-          if ! rclone lsf --drive-root-folder-id="$SRC_ID" gdrive: --max-depth 0 --log-level ERROR >/dev/null; then
-            echo "❌ La SA no puede listar la carpeta origen. Comprueba:"
-            echo "   - La SA es miembro/editor de esa carpeta o de la Unidad compartida"
-            echo "   - El ID es de CARPETA, no de archivo"
-            echo "   - Si la URL tenía ?resourcekey=..., compártela con la SA o usa --drive-resource-key"
+          # 1) Origen accesible
+          if ! rclone lsf gdrive: --max-depth 0 --log-level ERROR >/dev/null; then
+            echo "❌ No puedo listar la carpeta ORIGEN (permisos/ID)."
             exit 3
           fi
-          # 3) Carpeta destino (si está definida)
+          # 2) Destino (si está definido)
           if [ -n "$DST_ID" ]; then
-            if ! rclone lsf --drive-root-folder-id="$DST_ID" gdrive: --max-depth 0 --log-level ERROR >/dev/null; then
-              echo "❌ No puedo listar la carpeta destino (permisos/ID)."
+            cp "$RCLONE_CONFIG" rclone.dst.conf
+            perl -0777 -pe 's/(^root_folder_id = ).*/${1}$ENV{"DST_ID"}/m' -i rclone.dst.conf
+            RCLONE_CONFIG=$(pwd)/rclone.dst.conf rclone lsf gdrive: --max-depth 0 --log-level ERROR >/dev/null || {
+              echo "❌ No puedo listar la carpeta DESTINO (permisos/ID)."
               exit 4
-            fi
+            }
           fi
           echo "✅ Preflight OK"
 
@@ -75,21 +82,30 @@ jobs:
         run: |
           set -e
           mkdir -p in
-          SRC="${{ secrets.DRIVE_SRC_ID }}"
-          rclone copy --drive-root-folder-id="$SRC" "gdrive:${{ inputs.input_filename }}" in/ --log-level ERROR
-          rclone copy --drive-root-folder-id="$SRC" "gdrive:${{ inputs.intro_filename }}" in/ --log-level ERROR
-          rclone copy --drive-root-folder-id="$SRC" "gdrive:${{ inputs.outro_filename }}" in/ --log-level ERROR
+          # Comprobación mínima: existencia exacta de nombres (mayúsculas/espacios importan)
+          for f in "${{ inputs.input_filename }}" "${{ inputs.intro_filename }}" "${{ inputs.outro_filename }}"; do
+            if ! rclone lsf gdrive: --files-only --log-level ERROR | grep -Fx -- "$f" > /dev/null; then
+              echo "❌ No encuentro el archivo '$f' en la carpeta ORIGEN."
+              exit 5
+            fi
+          done
+          # Descargas (comillas por si hay espacios)
+          rclone copy "gdrive:${{ inputs.input_filename }}" in/ --log-level ERROR
+          rclone copy "gdrive:${{ inputs.intro_filename }}"  in/ --log-level ERROR
+          rclone copy "gdrive:${{ inputs.outro_filename }}"  in/ --log-level ERROR
 
       - name: Detectar parámetros del vídeo principal
         id: probe
         run: |
-          V_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 in/"${{ inputs.input_filename }}")
-          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 in/"${{ inputs.input_filename }}")
-          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 in/"${{ inputs.input_filename }}")
-          FPS_R=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 in/"${{ inputs.input_filename }}")
-          A_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 in/"${{ inputs.input_filename }}" || echo "aac")
-          A_SR=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 in/"${{ inputs.input_filename }}" || echo "48000")
-          A_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 in/"${{ inputs.input_filename }}" || echo "2")
+          set -e
+          VFILE="in/${{ inputs.input_filename }}"
+          V_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$VFILE")
+          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$VFILE")
+          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VFILE")
+          FPS_R=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$VFILE")
+          A_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$VFILE" || echo "aac")
+          A_SR=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$VFILE" || echo "48000")
+          A_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$VFILE" || echo "2")
           case "$V_CODEC" in
             h264) VLIB=libx264 ;;
             hevc|h265) VLIB=libx265; V_CODEC=hevc ;;
@@ -108,7 +124,7 @@ jobs:
           echo "asr=$A_SR"       >> $GITHUB_OUTPUT
           echo "ach=$A_CH"       >> $GITHUB_OUTPUT
 
-      - name: Adaptar SOLO intro y outro al principal
+      - name: Adaptar SOLO intro y outro al principal (para favorecer -c copy)
         run: |
           set -e
           VLIB='${{ steps.probe.outputs.vlib }}'
@@ -134,15 +150,24 @@ jobs:
           if ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt -c copy out.mp4; then
             echo "Concat -c copy OK"
           else
-            echo "Param mismatch duro; recodificando todo (puede alargar el tiempo)"
+            echo "Param mismatch; recodificando todo (tardará más)"
             ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt \
               -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k out.mp4
           fi
 
-      - name: Subir salida a Drive destino (sin listar)
+      - name: Subir salida a Drive DESTINO (o a ORIGEN si no hay destino)
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+          DST_ID: ${{ secrets.DRIVE_DST_ID }}
         run: |
-          DEST="${{ secrets.DRIVE_DST_ID }}"
-          [ -z "$DEST" ] && DEST="${{ secrets.DRIVE_SRC_ID }}"
-          rclone copyto out.mp4 "gdrive:${{ inputs.output_basename }}.mp4" --drive-root-folder-id="$DEST" --log-level ERROR
+          set -e
+          OUT="${{ inputs.output_basename }}.mp4"
+          if [ -n "$DST_ID" ]; then
+            # rclone.conf temporal anclado a DESTINO
+            cp "$RCLONE_CONFIG" rclone.dst.conf
+            perl -0777 -pe 's/(^root_folder_id = ).*/${1}$ENV{"DST_ID"}/m' -i rclone.dst.conf
+            RCLONE_CONFIG=$(pwd)/rclone.dst.conf rclone copyto out.mp4 "gdrive:${OUT}" --log-level ERROR
+          else
+            # Subir a la misma raíz (ORIGEN)
+            rclone copyto out.mp4 "gdrive:${OUT}" --log-level ERROR
+          fi
