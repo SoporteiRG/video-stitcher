@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       input_filename:
-        description: "Nombre del vídeo principal (nuevo) en la carpeta origen"
+        description: "Nombre del vídeo principal (como lo ves en Drive; con o sin extensión)"
         required: true
       intro_filename:
         description: "Nombre de la intro en la carpeta origen"
@@ -19,32 +19,29 @@ on:
 jobs:
   stitch:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # < 6h en runners hospedados
+    timeout-minutes: 350
 
     steps:
-      - name: Endurecer logs (enmascarar inputs por si aparecieran)
+      - name: Enmascarar inputs (por si aparecieran)
         run: |
           echo "::add-mask::${{ inputs.input_filename }}"
           echo "::add-mask::${{ inputs.intro_filename }}"
           echo "::add-mask::${{ inputs.outro_filename }}"
 
-      - name: Instalar ffmpeg y rclone
+      - name: Instalar ffmpeg, rclone y jq
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg jq
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Configurar rclone con Service Account y raíz de ORIGEN (secrets)
+      - name: Configurar rclone con Service Account y raíz ORIGEN (secrets)
         env:
           SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           SRC_ID: ${{ secrets.DRIVE_SRC_ID }}
         run: |
           set -e
           umask 077
-          # Clave de la Service Account
           printf '%s' "$SA_JSON" > sa.json
-
-          # rclone.conf anclado a la carpeta de ORIGEN vía root_folder_id (sin exponer IDs)
           cat > rclone.conf <<'EOF'
           [gdrive]
           type = drive
@@ -54,51 +51,104 @@ jobs:
           EOF
           perl -0777 -pe 's/__ROOT__/$ENV{"SRC_ID"}/g' -i rclone.conf
 
-      - name: Preflight Drive (comprobar acceso a origen/destino sin imprimir IDs)
+      - name: Preflight (acceso a ORIGEN/DESTINO)
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
           DST_ID: ${{ secrets.DRIVE_DST_ID }}
         run: |
           set -e
-          # 1) Origen accesible
-          if ! rclone lsf gdrive: --max-depth 0 --log-level ERROR >/dev/null; then
-            echo "❌ No puedo listar la carpeta ORIGEN (permisos/ID)."
-            exit 3
-          fi
-          # 2) Destino (si está definido)
+          rclone lsf gdrive: --max-depth 0 --log-level ERROR >/dev/null || { echo "❌ No puedo listar ORIGEN"; exit 3; }
           if [ -n "$DST_ID" ]; then
             cp "$RCLONE_CONFIG" rclone.dst.conf
             perl -0777 -pe 's/(^root_folder_id = ).*/${1}$ENV{"DST_ID"}/m' -i rclone.dst.conf
-            RCLONE_CONFIG=$(pwd)/rclone.dst.conf rclone lsf gdrive: --max-depth 0 --log-level ERROR >/dev/null || {
-              echo "❌ No puedo listar la carpeta DESTINO (permisos/ID)."
-              exit 4
-            }
+            RCLONE_CONFIG=$(pwd)/rclone.dst.conf rclone lsf gdrive: --max-depth 0 --log-level ERROR >/dev/null || { echo "❌ No puedo listar DESTINO"; exit 4; }
           fi
           echo "✅ Preflight OK"
 
-      - name: Descargar fuentes desde Drive (sin exponer rutas)
+      - name: Listado visible de archivos en ORIGEN (no se imprime el ID)
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        run: |
+          set -e
+          echo "📄 Contenido (sólo archivos) en la carpeta ORIGEN:"
+          rclone lsf gdrive: --files-only --log-level ERROR | sed 's/^/ - /'
+
+      - name: Resolver nombres (input/intro/outro) con tolerancia a extensión y mayúsculas
+        id: resolve
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+          IN_NAME: ${{ inputs.input_filename }}
+          INTRO_NAME: ${{ inputs.intro_filename }}
+          OUTRO_NAME: ${{ inputs.outro_filename }}
+        run: |
+          set -e
+          # Listado en JSON para resolver nombres sin depender de coincidencia exacta
+          rclone lsjson gdrive: --files-only --log-level ERROR > files.json
+          echo "ℹ️ Total archivos detectados en ORIGEN: $(jq 'length' files.json)"
+
+          resolve() {
+            # $1 = nombre introducido por input (con o sin extensión)
+            local needle="$1"
+            # Devuelve en stdout el nombre real encontrado en Drive o vacío
+            jq -r --arg in "$needle" '
+              # Normaliza a minúsculas
+              def norm(s): s|ascii_downcase;
+              # Construye {n: "Nombre.ext", nb: "Nombre"} para cada entrada
+              [ .[] | select(.IsDir!=true) | {n:.Name, nb:(.Name|sub("\\.[^.]*$";""))} ] as $items
+              |
+              # 1) Igualdad exacta (case-insensitive) con nombre completo
+              ( $items | map(select(norm(.n) == norm($in))) | if length>0 then .[0].n else null end ) //
+              # 2) Igualdad con nombre base (sin extensión)
+              ( $items | map(select(norm(.nb) == norm($in))) | if length>0 then .[0].n else null end ) //
+              # 3) Empieza por (útil para nombres largos)
+              ( $items | map(select(norm(.n) | startswith(norm($in)))) | if length>0 then .[0].n else null end ) //
+              # 4) Contiene
+              ( $items | map(select(norm(.n) | contains(norm($in)))) | if length>0 then .[0].n else "" end )
+            ' files.json
+          }
+
+          RES_INPUT="$(resolve "$IN_NAME")"
+          RES_INTRO="$(resolve "$INTRO_NAME")"
+          RES_OUTRO="$(resolve "$OUTRO_NAME")"
+
+          if [ -z "$RES_INPUT" ]; then
+            echo "❌ No encuentro el archivo de ENTRADA que corresponda a: '$IN_NAME'"
+            echo "👉 Revisa el listado anterior. Acepto con/sin extensión y coincidencias parciales."
+            exit 5
+          fi
+          if [ -z "$RES_INTRO" ]; then
+            echo "❌ No encuentro la INTRO: '$INTRO_NAME'"
+            exit 5
+          fi
+          if [ -z "$RES_OUTRO" ]; then
+            echo "❌ No encuentro el OUTRO: '$OUTRO_NAME'"
+            exit 5
+          fi
+
+          echo "input_resuelto=$RES_INPUT" >> $GITHUB_OUTPUT
+          echo "intro_resuelto=$RES_INTRO" >> $GITHUB_OUTPUT
+          echo "outro_resuelto=$RES_OUTRO" >> $GITHUB_OUTPUT
+
+          echo "✅ Resueltos:"
+          echo " - Input: $RES_INPUT"
+          echo " - Intro: $RES_INTRO"
+          echo " - Outro: $RES_OUTRO"
+
+      - name: Descargar fuentes desde Drive
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
           set -e
           mkdir -p in
-          # Comprobación mínima: existencia exacta de nombres (mayúsculas/espacios importan)
-          for f in "${{ inputs.input_filename }}" "${{ inputs.intro_filename }}" "${{ inputs.outro_filename }}"; do
-            if ! rclone lsf gdrive: --files-only --log-level ERROR | grep -Fx -- "$f" > /dev/null; then
-              echo "❌ No encuentro el archivo '$f' en la carpeta ORIGEN."
-              exit 5
-            fi
-          done
-          # Descargas (comillas por si hay espacios)
-          rclone copy "gdrive:${{ inputs.input_filename }}" in/ --log-level ERROR
-          rclone copy "gdrive:${{ inputs.intro_filename }}"  in/ --log-level ERROR
-          rclone copy "gdrive:${{ inputs.outro_filename }}"  in/ --log-level ERROR
+          rclone copy "gdrive:${{ steps.resolve.outputs.input_resuelto }}" in/ --log-level ERROR
+          rclone copy "gdrive:${{ steps.resolve.outputs.intro_resuelto }}"  in/ --log-level ERROR
+          rclone copy "gdrive:${{ steps.resolve.outputs.outro_resuelto }}"  in/ --log-level ERROR
 
       - name: Detectar parámetros del vídeo principal
         id: probe
         run: |
           set -e
-          VFILE="in/${{ inputs.input_filename }}"
+          VFILE="in/${{ steps.resolve.outputs.input_resuelto }}"
           V_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$VFILE")
           WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$VFILE")
           HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VFILE")
@@ -135,18 +185,18 @@ jobs:
           ASR='${{ steps.probe.outputs.asr }}'
           ACH='${{ steps.probe.outputs.ach }}'
 
-          ffmpeg -hide_banner -loglevel error -y -i "in/${{ inputs.intro_filename }}" \
+          ffmpeg -hide_banner -loglevel error -y -i "in/${{ steps.resolve.outputs.intro_resuelto }}" \
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
             -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" intro_t.mp4
 
-          ffmpeg -hide_banner -loglevel error -y -i "in/${{ inputs.outro_filename }}" \
+          ffmpeg -hide_banner -loglevel error -y -i "in/${{ steps.resolve.outputs.outro_resuelto }}" \
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
             -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" outro_t.mp4
 
       - name: Concatenar (sin recodificar el cuerpo; fallback si falla)
         run: |
           set -e
-          printf "file 'intro_t.mp4'\nfile 'in/${{ inputs.input_filename }}'\nfile 'outro_t.mp4'\n" > list.txt
+          printf "file 'intro_t.mp4'\nfile 'in/${{ steps.resolve.outputs.input_resuelto }}'\nfile 'outro_t.mp4'\n" > list.txt
           if ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt -c copy out.mp4; then
             echo "Concat -c copy OK"
           else
@@ -163,11 +213,9 @@ jobs:
           set -e
           OUT="${{ inputs.output_basename }}.mp4"
           if [ -n "$DST_ID" ]; then
-            # rclone.conf temporal anclado a DESTINO
             cp "$RCLONE_CONFIG" rclone.dst.conf
             perl -0777 -pe 's/(^root_folder_id = ).*/${1}$ENV{"DST_ID"}/m' -i rclone.dst.conf
             RCLONE_CONFIG=$(pwd)/rclone.dst.conf rclone copyto out.mp4 "gdrive:${OUT}" --log-level ERROR
           else
-            # Subir a la misma raíz (ORIGEN)
             rclone copyto out.mp4 "gdrive:${OUT}" --log-level ERROR
           fi
