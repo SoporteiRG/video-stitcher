@@ -41,7 +41,7 @@ jobs:
           service_account_file = ./sa.json
           EOF
 
-      - name: Preflight: obtener nombres por ID (y comprobar permisos)
+      - name: Preflight obtener nombres por ID (y comprobar permisos)
         id: meta
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
