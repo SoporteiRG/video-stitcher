@@ -1,0 +1,123 @@
+name: Stitch video from Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_filename:
+        description: "Nombre del vídeo principal (nuevo) en la carpeta origen"
+        required: true
+      intro_filename:
+        description: "Nombre de la intro en la carpeta origen"
+        default: "intro.mp4"
+      outro_filename:
+        description: "Nombre del cierre en la carpeta origen"
+        default: "outro.mp4"
+      output_basename:
+        description: "Nombre base del archivo de salida (sin .mp4)"
+        default: "salida"
+
+jobs:
+  stitch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # < 6h límite de runner hospedado
+    steps:
+      - name: Endurecer logs
+        run: |
+          echo "::add-mask::${{ inputs.input_filename }}"
+          echo "::add-mask::${{ inputs.intro_filename }}"
+          echo "::add-mask::${{ inputs.outro_filename }}"
+
+      - name: Instalar ffmpeg y rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configurar rclone con Service Account
+        run: |
+          umask 077
+          printf '%s' '${{ secrets.GDRIVE_SA_JSON }}' > sa.json
+          cat > rclone.conf <<'EOF'
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = ./sa.json
+          EOF
+
+      - name: Descargar fuentes desde Drive (sin exponer rutas)
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        run: |
+          set -e
+          mkdir -p in
+          SRC="${{ secrets.DRIVE_SRC_ID }}"
+          rclone copy --drive-root-folder-id="$SRC" "gdrive:${{ inputs.input_filename }}" in/ --log-level ERROR
+          rclone copy --drive-root-folder-id="$SRC" "gdrive:${{ inputs.intro_filename }}" in/ --log-level ERROR
+          rclone copy --drive-root-folder-id="$SRC" "gdrive:${{ inputs.outro_filename }}" in/ --log-level ERROR
+
+      - name: Detectar parámetros del vídeo principal
+        id: probe
+        run: |
+          V_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 in/"${{ inputs.input_filename }}")
+          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 in/"${{ inputs.input_filename }}")
+          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 in/"${{ inputs.input_filename }}")
+          FPS_R=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 in/"${{ inputs.input_filename }}")
+          A_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 in/"${{ inputs.input_filename }}" || echo "aac")
+          A_SR=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 in/"${{ inputs.input_filename }}" || echo "48000")
+          A_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 in/"${{ inputs.input_filename }}" || echo "2")
+          case "$V_CODEC" in
+            h264) VLIB=libx264 ;;
+            hevc|h265) VLIB=libx265; V_CODEC=hevc ;;
+            *) VLIB=libx264; V_CODEC=h264 ;;
+          esac
+          case "$A_CODEC" in
+            aac) ALIB=aac ;; mp3) ALIB=libmp3lame ;; opus) ALIB=libopus ;; *) ALIB=aac; A_CODEC=aac ;;
+          esac
+          echo "vcodec=$V_CODEC" >> $GITHUB_OUTPUT
+          echo "vlib=$VLIB"      >> $GITHUB_OUTPUT
+          echo "width=$WIDTH"    >> $GITHUB_OUTPUT
+          echo "height=$HEIGHT"  >> $GITHUB_OUTPUT
+          echo "fpsr=$FPS_R"     >> $GITHUB_OUTPUT
+          echo "acodec=$A_CODEC" >> $GITHUB_OUTPUT
+          echo "alib=$ALIB"      >> $GITHUB_OUTPUT
+          echo "asr=$A_SR"       >> $GITHUB_OUTPUT
+          echo "ach=$A_CH"       >> $GITHUB_OUTPUT
+
+      - name: Adaptar SOLO intro y outro al principal
+        run: |
+          set -e
+          VLIB='${{ steps.probe.outputs.vlib }}'
+          WIDTH='${{ steps.probe.outputs.width }}'
+          HEIGHT='${{ steps.probe.outputs.height }}'
+          FPSR='${{ steps.probe.outputs.fpsr }}'
+          ALIB='${{ steps.probe.outputs.alib }}'
+          ASR='${{ steps.probe.outputs.asr }}'
+          ACH='${{ steps.probe.outputs.ach }}'
+
+          ffmpeg -hide_banner -loglevel error -y -i "in/${{ inputs.intro_filename }}" \
+            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
+            -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" intro_t.mp4
+
+          ffmpeg -hide_banner -loglevel error -y -i "in/${{ inputs.outro_filename }}" \
+            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
+            -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" outro_t.mp4
+
+      - name: Concatenar (sin recodificar el cuerpo; fallback si falla)
+        run: |
+          set -e
+          printf "file 'intro_t.mp4'\nfile 'in/${{ inputs.input_filename }}'\nfile 'outro_t.mp4'\n" > list.txt
+          if ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt -c copy out.mp4; then
+            echo "Concat -c copy OK"
+          else
+            echo "Param mismatch duro; recodificando todo (puede alargar el tiempo)"
+            ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt \
+              -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k out.mp4
+          fi
+
+      - name: Subir salida a Drive destino (sin listar)
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        run: |
+          DEST="${{ secrets.DRIVE_DST_ID }}"
+          [ -z "$DEST" ] && DEST="${{ secrets.DRIVE_SRC_ID }}"
+          rclone copyto out.mp4 "gdrive:${{ inputs.output_basename }}.mp4" --drive-root-folder-id="$DEST" --log-level ERROR
