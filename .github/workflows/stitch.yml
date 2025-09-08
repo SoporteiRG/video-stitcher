@@ -155,4 +155,4 @@ jobs:
           fi
 
       - name: "Mostrar nombre final"
-        run: echo "✅ Subido: ${{ inputs.output_basename }}.mp4"
+        run: echo "Subido: ${{ inputs.output_basename }}.mp4"
