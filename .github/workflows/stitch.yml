@@ -21,15 +21,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: Install ffmpeg, rclone and jq
+      - name: Install ffmpeg and rclone
         shell: bash
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y ffmpeg jq
+          sudo apt-get install -y ffmpeg
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Configure rclone with Service Account (no root_folder_id)
+      - name: Configure rclone with Service Account
         shell: bash
         env:
           SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
@@ -44,36 +44,6 @@ jobs:
           service_account_file = ./sa.json
           EOF
 
-      - name: Preflight - resolve names from IDs and check access
-        id: meta
-        shell: bash
-        env:
-          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
-          IN_ID: ${{ inputs.input_id }}
-          INTRO_ID: ${{ inputs.intro_id }}
-          OUTRO_ID: ${{ inputs.outro_id }}
-        run: |
-          set -e
-          get_name () {
-            rclone backend query gdrive: "id = '$1'" | jq -r '.[0].name // empty'
-          }
-          IN_NAME=$(get_name "$IN_ID")
-          INTRO_NAME=$(get_name "$INTRO_ID")
-          OUTRO_NAME=$(get_name "$OUTRO_ID")
-
-          [ -z "$IN_NAME" ] && { echo "ERROR: sin acceso al ID de entrada"; exit 6; }
-          [ -z "$INTRO_NAME" ] && { echo "ERROR: sin acceso al ID de intro"; exit 6; }
-          [ -z "$OUTRO_NAME" ] && { echo "ERROR: sin acceso al ID de outro"; exit 6; }
-
-          echo "in_name=$IN_NAME" >> $GITHUB_OUTPUT
-          echo "intro_name=$INTRO_NAME" >> $GITHUB_OUTPUT
-          echo "outro_name=$OUTRO_NAME" >> $GITHUB_OUTPUT
-
-          echo "IDs ok:"
-          echo " - Input: $IN_NAME"
-          echo " - Intro: $INTRO_NAME"
-          echo " - Outro: $OUTRO_NAME"
-
       - name: Download by file IDs (copyid)
         shell: bash
         env:
@@ -81,16 +51,17 @@ jobs:
         run: |
           set -e
           mkdir -p in
-          rclone backend copyid gdrive: "${{ inputs.input_id }}"  "in/"
-          rclone backend copyid gdrive: "${{ inputs.intro_id }}"  "in/"
-          rclone backend copyid gdrive: "${{ inputs.outro_id }}"  "in/"
+          # Descarga por ID a nombres locales fijos (sin depender del nombre en Drive)
+          rclone backend copyid gdrive: "${{ inputs.input_id }}"  "in/input"
+          rclone backend copyid gdrive: "${{ inputs.intro_id }}"  "in/intro"
+          rclone backend copyid gdrive: "${{ inputs.outro_id }}"  "in/outro"
 
       - name: Probe main video parameters
         id: probe
         shell: bash
         run: |
           set -e
-          VFILE="in/${{ steps.meta.outputs.in_name }}"
+          VFILE="in/input"
           V_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$VFILE")
           WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$VFILE")
           HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VFILE")
@@ -131,19 +102,19 @@ jobs:
           ASR='${{ steps.probe.outputs.asr }}'
           ACH='${{ steps.probe.outputs.ach }}'
 
-          ffmpeg -hide_banner -loglevel error -y -i "in/${{ steps.meta.outputs.intro_name }}" \
+          ffmpeg -hide_banner -loglevel error -y -i "in/intro" \
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
             -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" intro_t.mp4
 
-          ffmpeg -hide_banner -loglevel error -y -i "in/${{ steps.meta.outputs.outro_name }}" \
-            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
+          ffmpeg -hide_banner -loglevel error -y -i "in/outro" \
+            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-ih)/2:(oh-ih)/2" \
             -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" outro_t.mp4
 
       - name: Concat (try -c copy, fallback reencode)
         shell: bash
         run: |
           set -e
-          printf "file 'intro_t.mp4'\nfile 'in/${{ steps.meta.outputs.in_name }}'\nfile 'outro_t.mp4'\n" > list.txt
+          printf "file 'intro_t.mp4'\nfile 'in/input'\nfile 'outro_t.mp4'\n" > list.txt
           if ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt -c copy out.mp4; then
             echo "Concat with -c copy OK"
           else
