@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       input_filename:
-        description: "Nombre del vídeo principal (como lo ves en Drive; con o sin extensión)"
+        description: "Nombre del vídeo principal (como lo ves en Drive; con o sin extensión o un fragmento)"
         required: true
       intro_filename:
         description: "Nombre de la intro en la carpeta origen"
@@ -73,7 +73,7 @@ jobs:
           echo "📄 Contenido (sólo archivos) en la carpeta ORIGEN:"
           rclone lsf gdrive: --files-only --log-level ERROR | sed 's/^/ - /'
 
-      - name: Resolver nombres (input/intro/outro) con tolerancia a extensión y mayúsculas
+      - name: Resolver nombres (tolerante a extensión, slashes y espacios)
         id: resolve
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
@@ -82,38 +82,58 @@ jobs:
           OUTRO_NAME: ${{ inputs.outro_filename }}
         run: |
           set -e
-          # Listado en JSON para resolver nombres sin depender de coincidencia exacta
+          # Listado JSON
           rclone lsjson gdrive: --files-only --log-level ERROR > files.json
           echo "ℹ️ Total archivos detectados en ORIGEN: $(jq 'length' files.json)"
 
+          # Normalización: convierte el slash "／" (U+FF0F) a "/", colon "：" (U+FF1A) a ":" y colapsa espacios
+          norm_shell() {
+            # $1 -> cadena
+            printf '%s' "$1" | sed -e 's/／/\//g' -e 's/：/:/g' -e 's/[[:space:]]\+/ /g' -e 's/^ *//; s/ *$//'
+          }
+
+          NEEDLE_RAW="$IN_NAME"
+          NEEDLE_NORM="$(norm_shell "$IN_NAME")"
+          echo "🔎 Buscando input por: '$NEEDLE_RAW'  (normalizado: '$NEEDLE_NORM')"
+
+          # Resolver en jq con scoring
           resolve() {
-            # $1 = nombre introducido por input (con o sin extensión)
             local needle="$1"
-            # Devuelve en stdout el nombre real encontrado en Drive o vacío
             jq -r --arg in "$needle" '
-              # Normaliza a minúsculas
-              def norm(s): s|ascii_downcase;
-              # Construye {n: "Nombre.ext", nb: "Nombre"} para cada entrada
-              [ .[] | select(.IsDir!=true) | {n:.Name, nb:(.Name|sub("\\.[^.]*$";""))} ] as $items
-              |
-              # 1) Igualdad exacta (case-insensitive) con nombre completo
-              ( $items | map(select(norm(.n) == norm($in))) | if length>0 then .[0].n else null end ) //
-              # 2) Igualdad con nombre base (sin extensión)
-              ( $items | map(select(norm(.nb) == norm($in))) | if length>0 then .[0].n else null end ) //
-              # 3) Empieza por (útil para nombres largos)
-              ( $items | map(select(norm(.n) | startswith(norm($in)))) | if length>0 then .[0].n else null end ) //
-              # 4) Contiene
-              ( $items | map(select(norm(.n) | contains(norm($in)))) | if length>0 then .[0].n else "" end )
+              def norm(s):
+                (s
+                 | gsub("\uFF0F";"/")
+                 | gsub("\uFF1A";":")
+                 | gsub("\\s+";" ")
+                 | sub("^\\s+";"")
+                 | sub("\\s+$";"")
+                 | ascii_downcase);
+              def base(s): s|sub("\\.[^.]*$";"");
+              [ .[] | select(.IsDir!=true) | .Name as $n |
+                {
+                  n: $n,
+                  score:
+                    (if norm($n) == norm($in) then 400 else 0 end) +
+                    (if norm(base($n)) == norm($in) then 300 else 0 end) +
+                    (if (norm($n) | startswith(norm($in))) then 200 else 0 end) +
+                    (if (norm($n) | contains(norm($in))) then 100 else 0 end) +
+                    (if ($n | endswith("Recording") or ($n|test("\\.mp4$"))) then 10 else 0 end)
+                }
+              ]
+              | (max_by(.score)|.n // "")
             ' files.json
           }
 
-          RES_INPUT="$(resolve "$IN_NAME")"
-          RES_INTRO="$(resolve "$INTRO_NAME")"
-          RES_OUTRO="$(resolve "$OUTRO_NAME")"
+          # Resuelve input con needle normalizado (para salvar / vs ／, espacios, etc.)
+          RES_INPUT="$(resolve "$NEEDLE_NORM")"
+          # Resuelve intro/outro tal cual
+          RES_INTRO="$(resolve "$(norm_shell "$INTRO_NAME")")"
+          RES_OUTRO="$(resolve "$(norm_shell "$OUTRO_NAME")")"
 
           if [ -z "$RES_INPUT" ]; then
             echo "❌ No encuentro el archivo de ENTRADA que corresponda a: '$IN_NAME'"
-            echo "👉 Revisa el listado anterior. Acepto con/sin extensión y coincidencias parciales."
+            echo "   (normalizado: '$NEEDLE_NORM')"
+            echo "👉 Revisa el listado anterior. Puedes pasar un fragmento distintivo del nombre."
             exit 5
           fi
           if [ -z "$RES_INTRO" ]; then
