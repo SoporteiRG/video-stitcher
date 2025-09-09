@@ -53,11 +53,11 @@ jobs:
           set -e
           echo "Forzando resolv.conf a 1.1.1.1 / 9.9.9.9 / 8.8.8.8"
           sudo bash -c 'cat >/etc/resolv.conf <<EOF
-nameserver 1.1.1.1
-nameserver 9.9.9.9
-nameserver 8.8.8.8
-options attempts:2 timeout:2
-EOF'
+			nameserver 1.1.1.1
+			nameserver 9.9.9.9
+			nameserver 8.8.8.8
+			options attempts:2 timeout:2
+			EOF'
           cat /etc/resolv.conf
 
           if [ "$PIN_HOSTS" = "true" ]; then
