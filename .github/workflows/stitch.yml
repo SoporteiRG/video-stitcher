@@ -1,5 +1,4 @@
 name: Stitch video from Google Drive (by IDs, 256MiB chunks + DNS/hosts tweaks)
-
 on:
   workflow_dispatch:
     inputs:
