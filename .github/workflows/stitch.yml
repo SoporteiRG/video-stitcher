@@ -15,3 +15,213 @@ on:
       output_basename:
         description: "Nombre base de salida (sin .mp4)"
         default: "salida"
+jobs:
+  stitch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Install ffmpeg, rclone, dnsutils
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg dnsutils
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone with Service Account
+        shell: bash
+        env:
+          SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+        run: |
+          set -e
+          umask 077
+          printf '%s' "$SA_JSON" > sa.json
+          cat > rclone.conf <<'EOF'
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = ./sa.json
+          EOF
+
+      - name: Network tweaks (force DNS + optional hosts pinning)
+        shell: bash
+        env:
+          # cambia a "false" si no quieres tocar /etc/hosts
+          PIN_HOSTS: "true"
+        run: |
+          set -e
+          echo "Forzando resolv.conf a 1.1.1.1 / 9.9.9.9 / 8.8.8.8"
+          sudo bash -c 'cat >/etc/resolv.conf <<EOF
+nameserver 1.1.1.1
+nameserver 9.9.9.9
+nameserver 8.8.8.8
+options attempts:2 timeout:2
+EOF'
+          cat /etc/resolv.conf
+
+          if [ "$PIN_HOSTS" = "true" ]; then
+            echo "Pinneando /etc/hosts para googleapis (puedes desactivar con PIN_HOSTS=false)"
+            DNS_SERVERS=("1.1.1.1" "9.9.9.9" "8.8.8.8")
+            HOSTS=("www.googleapis.com" "oauth2.googleapis.com")
+            for host in "${HOSTS[@]}"; do
+              # recoge A records desde varios resolvers y elige uno al azar
+              IP_LIST=$(for s in "${DNS_SERVERS[@]}"; do dig +short A "$host" @"$s"; done | sort -u)
+              IP=$(printf "%s\n" "$IP_LIST" | shuf -n1)
+              if [ -n "$IP" ]; then
+                echo " -> $host -> $IP"
+                # elimina líneas previas del host por si reintentas
+                sudo sed -i.bak "/[[:space:]]$host$/d" /etc/hosts
+                echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+              fi
+            done
+            echo "Comprobación /etc/hosts:"
+            tail -n +1 /etc/hosts
+          fi
+
+      - name: Download by file IDs (copyid)
+        shell: bash
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        run: |
+          set -e
+          mkdir -p in
+          # Descarga por ID a nombres locales fijos (sin depender del nombre en Drive)
+          rclone backend copyid gdrive: "${{ inputs.input_id }}"  "in/input"
+          rclone backend copyid gdrive: "${{ inputs.intro_id }}"  "in/intro"
+          rclone backend copyid gdrive: "${{ inputs.outro_id }}"  "in/outro"
+
+      - name: Probe main video parameters
+        id: probe
+        shell: bash
+        run: |
+          set -e
+          VFILE="in/input"
+          V_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$VFILE")
+          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$VFILE")
+          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VFILE")
+          FPS_R=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$VFILE")
+          A_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$VFILE" || echo "aac")
+          A_SR=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$VFILE" || echo "48000")
+          A_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$VFILE" || echo "2")
+          case "$V_CODEC" in
+            h264) VLIB=libx264 ;;
+            hevc|h265) VLIB=libx265; V_CODEC=hevc ;;
+            *) VLIB=libx264; V_CODEC=h264 ;;
+          esac
+          case "$A_CODEC" in
+            aac) ALIB=aac ;; mp3) ALIB=libmp3lame ;; opus) ALIB=libopus ;; *) ALIB=aac; A_CODEC=aac ;;
+          esac
+          echo "vlib=$VLIB"      >> $GITHUB_OUTPUT
+          echo "width=$WIDTH"    >> $GITHUB_OUTPUT
+          echo "height=$HEIGHT"  >> $GITHUB_OUTPUT
+          echo "fpsr=$FPS_R"     >> $GITHUB_OUTPUT
+          echo "alib=$ALIB"      >> $GITHUB_OUTPUT
+          echo "asr=$A_SR"       >> $GITHUB_OUTPUT
+          echo "ach=$A_CH"       >> $GITHUB_OUTPUT
+
+      - name: Transcode only intro and outro to match main
+        shell: bash
+        run: |
+          set -e
+          VLIB='${{ steps.probe.outputs.vlib }}'
+          WIDTH='${{ steps.probe.outputs.width }}'
+          HEIGHT='${{ steps.probe.outputs.height }}'
+          FPSR='${{ steps.probe.outputs.fpsr }}'
+          ALIB='${{ steps.probe.outputs.alib }}'
+          ASR='${{ steps.probe.outputs.asr }}'
+          ACH='${{ steps.probe.outputs.ach }}'
+
+          ffmpeg -hide_banner -loglevel error -y -i "in/intro" \
+            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
+            -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" intro_t.mp4
+
+          ffmpeg -hide_banner -loglevel error -y -i "in/outro" \
+            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
+            -r "$FPSR" -c:v "$VLIB" -pix_fmt yuv420p -c:a "$ALIB" -ar "$ASR" -ac "$ACH" outro_t.mp4
+
+      - name: Concat (try -c copy, fallback reencode)
+        shell: bash
+        run: |
+          set -e
+          printf "file 'intro_t.mp4'\nfile 'in/input'\nfile 'outro_t.mp4'\n" > list.txt
+          if ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt -c copy out.mp4; then
+            echo "Concat with -c copy OK"
+          else
+            echo "Param mismatch; reencoding all"
+            ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt \
+              -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k out.mp4
+          fi
+
+      - name: Upload output to destination folder by ID (256MiB chunks + backoff + repin)
+        shell: bash
+        env:
+          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+          DST_ID: ${{ secrets.DRIVE_DST_ID }}
+        run: |
+          set -e
+          OUT="${{ inputs.output_basename }}.mp4"
+
+          # Config anclado a carpeta destino si hay ID (Shared Drive recomendado)
+          CONF="$RCLONE_CONFIG"
+          if [ -n "$DST_ID" ]; then
+            cp "$RCLONE_CONFIG" rclone.dst.conf
+            echo "root_folder_id = $DST_ID" >> rclone.dst.conf
+            CONF="$(pwd)/rclone.dst.conf"
+          fi
+
+          FLAGS="--drive-chunk-size 256M \
+                 --transfers 1 --checkers 4 \
+                 --tpslimit 2 --tpslimit-burst 2 \
+                 --retries 7 --retries-sleep 20s --low-level-retries 50 \
+                 --user-agent rclone-gha/1.0"
+
+          try_upload () {
+            set +e
+            LOG=$(mktemp)
+            RCLONE_CONFIG="$CONF" rclone copyto out.mp4 "gdrive:${OUT}" --log-level ERROR $FLAGS 2>"$LOG"
+            RC=$?
+            set -e
+            echo "rclone exit: $RC"
+            if [ $RC -ne 0 ]; then
+              echo "----- rclone stderr (tail) -----"
+              tail -n 50 "$LOG" || true
+              echo "--------------------------------"
+              if grep -q "HTTP response code 429" "$LOG"; then
+                return 429
+              fi
+              return $RC
+            fi
+            return 0
+          }
+
+          # hasta 6 intentos: si 429, repinnea hosts a otra IP y backoff creciente
+          for i in $(seq 1 6); do
+            echo "Upload attempt $i ..."
+            if try_upload; then
+              echo "Uploaded: ${OUT}"
+              exit 0
+            fi
+            ERR=$?
+            if [ "$ERR" = "429" ]; then
+              echo "429 detected, rotating host pins for googleapis..."
+              # repinnea ambos hosts con otra IP aleatoria
+              for host in www.googleapis.com oauth2.googleapis.com; do
+                sudo sed -i.bak "/[[:space:]]$host$/d" /etc/hosts
+                IP=$(for s in 1.1.1.1 9.9.9.9 8.8.8.8; do dig +short A "$host" @"$s"; done | sort -u | shuf -n1)
+                if [ -n "$IP" ]; then
+                  echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+                  echo "Pinned $host -> $IP"
+                fi
+              done
+              S=$((i*30))
+              echo "Sleeping ${S}s before retry..."
+              sleep $S
+              continue
+            else
+              echo "Non-429 error ($ERR). Aborting."
+              exit $ERR
+            fi
+          done
+
+          echo "Upload failed after retries."
+          exit 1
