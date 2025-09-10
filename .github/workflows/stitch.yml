@@ -1,4 +1,4 @@
-name: Stitch video from Google Drive (by IDs)
+name: Stitch video from Google Drive (by IDs, 256MiB + DNS/hosts)
 
 on:
   workflow_dispatch:
@@ -15,10 +15,12 @@ on:
       output_basename:
         description: "Nombre base de salida (sin .mp4)"
         default: "salida"
+
 jobs:
   stitch:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+
     steps:
       - name: Install ffmpeg, rclone, dnsutils
         shell: bash
@@ -46,35 +48,31 @@ jobs:
       - name: Network tweaks (force DNS + optional hosts pinning)
         shell: bash
         env:
-          # cambia a "false" si no quieres tocar /etc/hosts
-          PIN_HOSTS: "true"
+          PIN_HOSTS: "true"   # cambia a "false" si no quieres tocar /etc/hosts
         run: |
           set -e
-          echo "Forzando resolv.conf a 1.1.1.1 / 9.9.9.9 / 8.8.8.8"
-          sudo bash -c 'cat >/etc/resolv.conf <<EOF
-nameserver 1.1.1.1
-nameserver 9.9.9.9
-nameserver 8.8.8.8
-options attempts:2 timeout:2
-EOF'
+          # Forzar resolv.conf con DNS conocidos (sin comillas dentro del EOF para evitar expansiones)
+          sudo tee /etc/resolv.conf >/dev/null <<'EOF'
+          nameserver 1.1.1.1
+          nameserver 9.9.9.9
+          nameserver 8.8.8.8
+          options attempts:2 timeout:2
+          EOF
           cat /etc/resolv.conf
 
           if [ "$PIN_HOSTS" = "true" ]; then
-            echo "Pinneando /etc/hosts para googleapis (puedes desactivar con PIN_HOSTS=false)"
-            DNS_SERVERS=("1.1.1.1" "9.9.9.9" "8.8.8.8")
-            HOSTS=("www.googleapis.com" "oauth2.googleapis.com")
-            for host in "${HOSTS[@]}"; do
-              # recoge A records desde varios resolvers y elige uno al azar
-              IP_LIST=$(for s in "${DNS_SERVERS[@]}"; do dig +short A "$host" @"$s"; done | sort -u)
-              IP=$(printf "%s\n" "$IP_LIST" | shuf -n1)
+            echo "Pinneando /etc/hosts para googleapis (desactiva con PIN_HOSTS=false)"
+            for host in www.googleapis.com oauth2.googleapis.com; do
+              IP="$(
+                { dig +short A "$host" @1.1.1.1; dig +short A "$host" @9.9.9.9; dig +short A "$host" @8.8.8.8; } \
+                | sort -u | shuf -n1
+              )"
               if [ -n "$IP" ]; then
-                echo " -> $host -> $IP"
-                # elimina líneas previas del host por si reintentas
                 sudo sed -i.bak "/[[:space:]]$host$/d" /etc/hosts
                 echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+                echo "Pinned $host -> $IP"
               fi
             done
-            echo "Comprobación /etc/hosts:"
             tail -n +1 /etc/hosts
           fi
 
@@ -85,7 +83,6 @@ EOF'
         run: |
           set -e
           mkdir -p in
-          # Descarga por ID a nombres locales fijos (sin depender del nombre en Drive)
           rclone backend copyid gdrive: "${{ inputs.input_id }}"  "in/input"
           rclone backend copyid gdrive: "${{ inputs.intro_id }}"  "in/intro"
           rclone backend copyid gdrive: "${{ inputs.outro_id }}"  "in/outro"
@@ -152,7 +149,7 @@ EOF'
               -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k out.mp4
           fi
 
-      - name: Upload output to destination folder by ID (256MiB chunks + backoff + repin)
+      - name: Upload output to destination folder by ID (256MiB chunks + backoff)
         shell: bash
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
@@ -161,7 +158,6 @@ EOF'
           set -e
           OUT="${{ inputs.output_basename }}.mp4"
 
-          # Config anclado a carpeta destino si hay ID (Shared Drive recomendado)
           CONF="$RCLONE_CONFIG"
           if [ -n "$DST_ID" ]; then
             cp "$RCLONE_CONFIG" rclone.dst.conf
@@ -169,7 +165,7 @@ EOF'
             CONF="$(pwd)/rclone.dst.conf"
           fi
 
-          FLAGS="--drive-chunk-size 256M \
+          FLAGS="--drive-chunk-size 512M \
                  --transfers 1 --checkers 4 \
                  --tpslimit 2 --tpslimit-burst 2 \
                  --retries 7 --retries-sleep 20s --low-level-retries 50 \
@@ -194,7 +190,6 @@ EOF'
             return 0
           }
 
-          # hasta 6 intentos: si 429, repinnea hosts a otra IP y backoff creciente
           for i in $(seq 1 6); do
             echo "Upload attempt $i ..."
             if try_upload; then
@@ -203,20 +198,9 @@ EOF'
             fi
             ERR=$?
             if [ "$ERR" = "429" ]; then
-              echo "429 detected, rotating host pins for googleapis..."
-              # repinnea ambos hosts con otra IP aleatoria
-              for host in www.googleapis.com oauth2.googleapis.com; do
-                sudo sed -i.bak "/[[:space:]]$host$/d" /etc/hosts
-                IP=$(for s in 1.1.1.1 9.9.9.9 8.8.8.8; do dig +short A "$host" @"$s"; done | sort -u | shuf -n1)
-                if [ -n "$IP" ]; then
-                  echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
-                  echo "Pinned $host -> $IP"
-                fi
-              done
               S=$((i*30))
-              echo "Sleeping ${S}s before retry..."
+              echo "429 detected. Sleeping ${S}s before retry..."
               sleep $S
-              continue
             else
               echo "Non-429 error ($ERR). Aborting."
               exit $ERR
